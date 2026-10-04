@@ -73,9 +73,20 @@ class OrakleScheduler:
         capabilities = self.cap_manager.get_capabilities()
 
         for name, info in capabilities.items():
-            # We only support scheduling for native skills for now,
-            # as we need access to the class attribute 'default_schedule'
-            if info.get("type") != "skill":
+            # We support scheduling for both native skills ("skill",
+            # loaded from orakle/skills/) and user skills ("user_skill",
+            # loaded from my_skills/) -- both are plain Skill subclasses
+            # with a 'default_schedule' class attribute, and
+            # capabilities/manager.py already treats them as equivalent
+            # everywhere else (see its own `cap_data["type"] in ("skill",
+            # "user_skill")` check) -- this used to only accept "skill",
+            # which silently skipped every user skill's default_schedule
+            # even when correctly set (confirmed live 2026-09-26: Dave's
+            # ToolsCalendar/ToolsApi_status/ToolsFootball each got
+            # "skipping skill ...: is not basic type skill" on every
+            # restart, while messaging_inbox -- a native skill -- always
+            # scheduled fine).
+            if info.get("type") not in ("skill", "user_skill"):
                 logger.info(f"skipping skill {name}: is not basic type skill")
                 continue
 

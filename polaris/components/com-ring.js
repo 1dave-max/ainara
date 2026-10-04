@@ -515,6 +515,18 @@ class ComRing extends BaseComponent {
             }
         });
 
+        // Popup screens (nexus / user-skill components) can ask Ainara to close
+        // all popups, e.g. the Coding Classroom when the user says "close my
+        // classroom for today". The popup posts {type: 'ainara:close-documents'}.
+        window.addEventListener('message', (e) => {
+            const d = e.data;
+            if (d && typeof d === 'object' && d.type === 'ainara:close-documents') {
+                console.log('ComRing: a popup asked to close all documents');
+                this.documentView.clear();
+                this.switchToRingView();
+            }
+        });
+
         // Listen for history navigation events from the document-view component
         this.documentView.addEventListener('documentview-history-prev-clicked', () => this.navigateHistory('prev'));
         this.documentView.addEventListener('documentview-history-next-clicked', () => this.navigateHistory('next'));
@@ -602,6 +614,12 @@ class ComRing extends BaseComponent {
 
         // Debug keyboard events
         document.addEventListener('keydown', async (event) => {
+            // Track the physical state of the push-to-talk key synchronously,
+            // before any await, so a release that happens while we are still
+            // awaiting below is never lost.
+            if (event.code === this.triggerKey) {
+                this.triggerHeld = true;
+            }
             // console.log("EVENT KEYDOWN");
             // console.log(event);
             if (this.currentView === 'document' && event.key === this.config.get('shortcuts.hide', 'Escape')) {
@@ -652,6 +670,10 @@ class ComRing extends BaseComponent {
 
                 // console.log('ComRing: key detected: ' + event.key);
                 if (!isTypingMode && event.code === this.triggerKey) {
+                    // The key may have been released while we awaited the
+                    // typing-mode check; if so, don't start a recording that
+                    // nothing will ever stop.
+                    if (!this.triggerHeld) return;
                     this.state.keyPressed = true;
                     if (!this.state.isRecording) {
                         console.log('ComRing: Shortcut detected - starting recording');
@@ -688,11 +710,18 @@ class ComRing extends BaseComponent {
         document.addEventListener('keyup', (event) => {
             // console.log("keyup");
             // If we were recording and the modifier key was released
-            if (this.state.isRecording &&
-                event.code === this.triggerKey) {
-                console.log('ComRing: stopping recording');
+            // Always record the release of the push-to-talk key, even if the
+            // recording hasn't fully started yet (startRecording awaits the
+            // audio stream before setting isRecording). Previously a release
+            // during that window was ignored, leaving keyPressed stuck at true,
+            // which also disables the VAD silence auto-stop -> endless listening.
+            if (event.code === this.triggerKey) {
+                this.triggerHeld = false;
                 this.state.keyPressed = false;
-                this.stopRecording();
+                if (this.state.isRecording) {
+                    console.log('ComRing: stopping recording');
+                    this.stopRecording();
+                }
             }
         });
 

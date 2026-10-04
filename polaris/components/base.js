@@ -250,18 +250,31 @@ class BaseComponent extends HTMLElement {
         return this._processMarkdownBlock(text, isChatLog);
     }
 
+    escapeHtml(str) {
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
     _processMarkdownBlock(text, isChatLog = false) {
          // Store code blocks temporarily
         const codeBlocks = [];
         let blockIndex = 0;
 
-        // Sanitize HTML to prevent XSS attacks
-        text = this.sanitizeText(text);
+        // NOTE: Special blocks and code spans are extracted BEFORE sanitizing,
+        // and their contents are HTML-escaped. Sanitizing first turned tag
+        // names mentioned in backticks (e.g. `<b>`, `<em>`, `<strong>`) into
+        // real unclosed elements; once wrapped in <code> the misnested HTML
+        // made the browser re-open <code> for every following message, so
+        // the rest of the history rendered grey, indented and pre-wrapped.
 
         // Blocks extracted to prevent markdown parsing on them
         // Extract ORAKLE skills blocks
         text = text.replace(/_orakle_loading_signal_\|([^ \n]+)/gm, (text,skill) => {
-            codeBlocks.push(`<span class="orakle-skill" title="Orakle Skill">${skill}</span>`);
+            codeBlocks.push(`<span class="orakle-skill" title="Orakle Skill">${this.escapeHtml(skill)}</span>`);
             return `%%CODEBLOCK${blockIndex++}%%`;
         });
 
@@ -270,21 +283,21 @@ class BaseComponent extends HTMLElement {
             try {
                 const orakleUrl = this.config.get('orakle.api_url');
                 const json = JSON.parse(skill);
-                
+
                 // Encode data to be safe in HTML attribute
                 const encodedData = encodeURIComponent(JSON.stringify(json.data));
-                const src = `${orakleUrl}${json.component_path}`;
-                
+                const src = this.escapeHtml(`${orakleUrl}${json.component_path}`);
+
                 const output = `<iframe class='nexus-frame' src='${src}' data-nexus-data='${encodedData}' sandbox='allow-scripts allow-same-origin allow-forms'></iframe>`;
                 codeBlocks.push(output);
             } catch (error) {
                 console.error('Error details:', error);
+                codeBlocks.push('');
             }
             return `%%CODEBLOCK${blockIndex++}%%`;
         });
 
         if (isChatLog) {
-            // generate links in the format expected by the chat log view
             text = text.replace(/```([^ \n]*)([\s\S]*?)```/gm, (match, codetype, content) => {
                 // TODO Disabled markdown table process by now
                 // if (this.isMarkdownTable(content)) {
@@ -295,19 +308,25 @@ class BaseComponent extends HTMLElement {
                 //     <div>${html_content}</div>
                 // </div>`);
                 codeBlocks.push(`<div class="code-block-wrapper">
-                    <span class="code-type">${codetype}</span>
+                    <span class="code-type">${this.escapeHtml(codetype)}</span>
                     <button class="copy-btn">Copy</button>
-                    <code>${content}</code>
+                    <code>${this.escapeHtml(content)}</code>
                 </div>`);
                 return `%%CODEBLOCK${blockIndex++}%%`;
             });
             // Extract and replace single backtick inline code
             text = text.replace(/`([\s\S]*?)`/gm, (match, content) => {
                 codeBlocks.push(`<div class="code-block-wrapper-inline">
-                    <code>${content}</code>
+                    <code>${this.escapeHtml(content)}</code>
                 </div>`);
                 return `%%CODEBLOCK${blockIndex++}%%`;
             });
+        }
+
+        // Sanitize HTML to prevent XSS attacks (code already extracted above)
+        text = this.sanitizeText(text);
+
+        if (isChatLog) {
             // Process links
             text = text.replace(
                 /(http(s)?:\/\/.)(www\.)?[-a-zA-Z0-9@:%._+~#=]{2,256}\.[a-z]{2,6}\b([-a-zA-Z0-9@:%_+.~#?&//=]*)/gm, (match) => {

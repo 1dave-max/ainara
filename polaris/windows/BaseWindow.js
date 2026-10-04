@@ -32,7 +32,8 @@ class BaseWindow {
             webPreferences: {
                 nodeIntegration: true,
                 contextIsolation: false,
-                webSecurity: false
+                webSecurity: false,
+                backgroundThrottling: false
             },
             icon: path.join(
                 this.basePath, 
@@ -135,13 +136,14 @@ class BaseWindow {
 
     hide() {
         this.window.hide();
-        // Enable background throttling when window is hidden
+        // NOTE: background throttling is kept disabled (see webPreferences.backgroundThrottling)
+        // even while hidden - enabling it here throttles renderer timers and was causing
+        // audio to drop/stutter while the window is in the background.
         if (this.window.webContents) {
             this.window.webContents.send("hide");
-            this.window.webContents.setBackgroundThrottling(true);
-            // Set minimum possible frame rate when hidden
+            // Still drop the frame rate to save CPU/GPU, but don't touch background throttling.
             this.window.webContents.setFrameRate(1); // 1 FPS is the minimum
-            Logger.log(`${this.name} background throttling enabled, frame rate set to minimum`);
+            Logger.log(`${this.name} hidden, frame rate set to minimum (background throttling left disabled for audio)`);
         }
     }
 

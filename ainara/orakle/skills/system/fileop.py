@@ -67,7 +67,7 @@ class SystemFileop(Skill):
         ] = None,
     ) -> Dict[str, Any]:
         """Perform file system operations"""
-        path = Path(path)
+        path = Path(path).expanduser()
 
         operations = {
             "read": self._read_file,
