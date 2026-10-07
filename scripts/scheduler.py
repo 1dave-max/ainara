@@ -113,6 +113,7 @@ except (AttributeError, ValueError):
 # ---------------------------------------------------------------------------
 import argparse  # noqa: E402
 import json  # noqa: E402
+import shutil  # noqa: E402
 import signal  # noqa: E402
 import subprocess  # noqa: E402
 import threading  # noqa: E402
@@ -197,6 +198,12 @@ DEFAULT_RESTART_GRACE_POLL_INTERVAL = 5
 DEFAULT_MAX_RESTART_ATTEMPTS = 3
 HEARTBEAT_LOG_INTERVAL = 60
 HEALTH_CHECK_TIMEOUT = 3
+
+# Log rotation for the scheduler's OWN captured logs (ORAKLE_LOG and
+# BUREAU_LOG) — see rotate_log_if_large.
+DEFAULT_LOG_ROTATE_MAX_MB = 10
+DEFAULT_LOG_ROTATE_BACKUP_COUNT = 5
+LOG_ROTATE_CHECK_INTERVAL = 60  # seconds; mirrors HEARTBEAT_LOG_INTERVAL
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +338,67 @@ def load_scheduler_config(raw):
             "max_restart_attempts", DEFAULT_MAX_RESTART_ATTEMPTS
         ),
     }
+
+
+def _load_log_rotation_config():
+    """(max_bytes, backup_count) for rotating the scheduler's OWN captured
+    logs — read fresh on every check (see LOG_ROTATE_CHECK_INTERVAL) so a
+    config change takes effect without a scheduler restart.
+
+    Deliberately SEPARATE keys from the framework's own logging.max_size_mb /
+    logging.backup_count (ainara/framework/logging_setup.py, which already
+    rotates orakle.log/bureau.log/pybridge.log via RotatingFileHandler): that
+    key's default is a raw BYTE count despite its "_mb" name, so a value
+    someone actually sets there meaning megabytes would be read as bytes and
+    rotate on almost every line. New code gets its own, correctly-named keys
+    rather than inheriting that ambiguity.
+    """
+    try:
+        mgr = ConfigManager()
+        max_mb = float(mgr.get("logging.rotation.max_size_mb",
+                               DEFAULT_LOG_ROTATE_MAX_MB))
+        backups = int(mgr.get("logging.rotation.backup_count",
+                             DEFAULT_LOG_ROTATE_BACKUP_COUNT))
+        return max_mb * 1024 * 1024, backups
+    except Exception as e:
+        log_error(f"could not read log-rotation config, using defaults: {e}")
+        return (DEFAULT_LOG_ROTATE_MAX_MB * 1024 * 1024,
+                DEFAULT_LOG_ROTATE_BACKUP_COUNT)
+
+
+def rotate_log_if_large(log_file, max_bytes, backup_count):
+    """Copytruncate rotation for a log a subprocess holds open as its stdout/
+    stderr for its entire lifetime (every log start_service() manages).
+
+    Renaming the live file would leave that subprocess writing into the now-
+    invisible, renamed-away inode forever — nothing here can tell a plain
+    subprocess to reopen stdout the way SIGHUP tells nginx or syslog to.
+    Copying the content out to a numbered backup and then truncating the
+    ORIGINAL file IN PLACE keeps the subprocess's existing file descriptor
+    valid; it simply starts writing into an empty file again. This is
+    logrotate's own 'copytruncate' strategy, built for exactly this situation.
+
+    backup_count <= 0 truncates without keeping history (matches stdlib
+    RotatingFileHandler's own backupCount=0 semantics).
+    """
+    try:
+        if not os.path.exists(log_file) or os.path.getsize(log_file) < max_bytes:
+            return
+        oldest = f"{log_file}.{backup_count}"
+        if backup_count > 0 and os.path.exists(oldest):
+            os.remove(oldest)
+        for i in range(backup_count - 1, 0, -1):
+            src, dst = f"{log_file}.{i}", f"{log_file}.{i + 1}"
+            if os.path.exists(src):
+                os.replace(src, dst)
+        if backup_count > 0:
+            shutil.copy2(log_file, f"{log_file}.1")
+        with open(log_file, "r+") as f:
+            f.truncate(0)
+        log_info(f"rotated {log_file} (reached {max_bytes} bytes)")
+    except Exception as e:
+        # Never let log-hygiene housekeeping take down the supervisor loop.
+        log_error(f"log rotation failed for {log_file}: {e}")
 
 
 def load_schedules(raw):
@@ -470,7 +538,10 @@ def start_service(service_name, cmd, log_file):
     env["PYTHONIOENCODING"] = "utf-8"
 
     try:
-        with open(log_file, "w") as log:
+        # APPEND, never truncate: a supervisor that restarts a crashed
+        # service and erases the log explaining why it crashed destroys the
+        # one record of the failure. Growth is bounded by rotate_log_if_large.
+        with open(log_file, "a") as log:
             if os.name == "nt":
                 subprocess.Popen(cmd, stdout=log, stderr=log, env=env)
             else:
@@ -536,12 +607,19 @@ def restart_service(service_name, cmd, log_file, health_url, sched_config):
 # ---------------------------------------------------------------------------
 # Plan triggering
 # ---------------------------------------------------------------------------
-def trigger_plan(plan_name, bureau_url, avoid_if=None):
-    """Trigger a plan execution via Bureau API."""
+def trigger_plan(plan_name, bureau_url, avoid_if=None, variables=None):
+    """Trigger a plan execution via Bureau API.
+
+    variables (a flat dict) overrides values of the plan's own `variables`
+    for this run only, so one plan can be run with different inputs. Bureau
+    refuses names the plan does not declare.
+    """
     url = f"{bureau_url}/v1/conductor/plans/{plan_name}/run"
     body = {}
     if avoid_if:
         body["avoid_if"] = avoid_if
+    if variables:
+        body["variables"] = variables
     try:
         response = requests.post(url, json=body or None, timeout=30)
         if response.status_code == 200 or response.status_code == 202:
@@ -597,10 +675,24 @@ def build_scheduler(schedules, bureau_url):
                 day_of_week=parts[4],
             )
             avoid_if = plan_config.get("avoid_if")
+            # Optional per-schedule overrides, so the same plan can be
+            # scheduled more than once with different inputs: `plan` names
+            # the plan to run (defaulting to the schedule key, which stays
+            # the job id) and `variables` overrides its declared variables.
+            if "vars" in plan_config:
+                # The old key. Ignoring it would run the plan's defaults under
+                # a schedule the operator believes overrides them.
+                log_error(
+                    f"Plan '{plan_name}' uses 'vars:', which was renamed to"
+                    " 'variables:'. Not scheduling it until the key is renamed."
+                )
+                continue
+            variables = plan_config.get("variables")
+            target_plan = plan_config.get("plan", plan_name)
             scheduler.add_job(
                 trigger_plan,
                 trigger=trigger,
-                args=[plan_name, bureau_url, avoid_if],
+                args=[target_plan, bureau_url, avoid_if, variables],
                 id=plan_name,
                 name=f"Plan: {plan_name}",
                 replace_existing=True,
@@ -709,6 +801,7 @@ def watchdog_loop(sched_config):
 
     restart_counters = {name: 0 for name in services}
     last_heartbeat = time.time()
+    last_log_rotation_check = time.time()
     interval = sched_config["health_check_interval"]
     max_attempts = sched_config["max_restart_attempts"]
 
@@ -722,6 +815,15 @@ def watchdog_loop(sched_config):
                 f"Watchdog heartbeat — monitoring {len(services)} service(s)"
             )
             last_heartbeat = now
+
+        # Rotate the logs this scheduler captures directly (raw subprocess
+        # stdout/stderr, never rotated on their own). Checked far less often
+        # than health, since the common case is just a cheap size stat.
+        if now - last_log_rotation_check >= LOG_ROTATE_CHECK_INTERVAL:
+            max_bytes, backup_count = _load_log_rotation_config()
+            for svc in services.values():
+                rotate_log_if_large(svc["log"], max_bytes, backup_count)
+            last_log_rotation_check = now
 
         for name, svc in services.items():
             if not check_service_health(svc["health_url"]):
@@ -823,6 +925,15 @@ def parse_args():
             "(used with --run-plan)"
         ),
     )
+    parser.add_argument(
+        "--var",
+        metavar="NAME=VALUE",
+        action="append",
+        help=(
+            "Override one of the plan's declared variables for this run; "
+            "repeatable (used with --run-plan)"
+        ),
+    )
     return parser.parse_args()
 
 
@@ -894,8 +1005,16 @@ def main():
             avoid_if = [p.strip() for p in args.avoid_if.split(",")]
         else:
             avoid_if = (schedules.get(args.run_plan) or {}).get("avoid_if")
+        variables = {}
+        for item in args.var or []:
+            name, sep, value = item.partition("=")
+            if not sep or not name.strip():
+                log_error(f"--var expects NAME=VALUE, got '{item}'")
+                sys.exit(2)
+            variables[name.strip()] = value.strip()
         success = trigger_plan(
-            args.run_plan, sched_config["bureau_url"], avoid_if=avoid_if
+            args.run_plan, sched_config["bureau_url"], avoid_if=avoid_if,
+            variables=variables or None,
         )
         sys.exit(0 if success else 1)
 

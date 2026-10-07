@@ -52,9 +52,20 @@ async function generateSkillsUI(ctx) {
         const properties = await propsResp.json();
         const backendConfig = await ctx.api.loadBackendConfig();
 
+        // Nexus subscription/install state from Pybridge (optional feature:
+        // degrade gracefully if unavailable)
+        let nexusApps = null;
+        try {
+            const pybridgeUrl = ctx.config.get('pybridge.api_url');
+            const nexusResp = await fetch(pybridgeUrl + '/nexus/apps');
+            if (nexusResp.ok) nexusApps = await nexusResp.json();
+        } catch (e) {
+            console.warn('Nexus apps state unavailable:', e);
+        }
+
         const scheduleHtml = generateScheduleUI(capabilities, backendConfig);
         const userSkillsHtml = generateUserSkillsUI();
-        const nexusHtml = generateNexusUI(properties, backendConfig);   // <-- now uses properties
+        const nexusHtml = generateNexusUI(properties, backendConfig, nexusApps);
 
         const tabStyles = `
             <style>
@@ -831,9 +842,11 @@ function updateNexusSectionSummary(detailsEl) {
     desc.textContent = formatNexusPropertySummary(total, modified);
 }
 
-function generateNexusUI(properties, backendConfig) {
+function generateNexusUI(properties, backendConfig, nexusApps) {
     const apps = groupNexusApps(properties);
-    if (apps.length === 0) return '';
+    const appState = new Map(
+        (nexusApps || []).map(a => [`${a.vendor}/${a.app}`, a])
+    );
 
     const nexusStyles = `
         <style>
@@ -962,11 +975,82 @@ function generateNexusUI(properties, backendConfig) {
                 color: #dc3545;
                 font-weight: bold;
             }
+            .nexus-search-options {
+                margin-top: 8px;
+                font-size: 0.88em;
+            }
+            .nexus-search-options label {
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
+                cursor: pointer;
+                color: #555;
+                user-select: none;
+            }
+
+            /* Nexus subscriptions & install (Stage C) */
+            .nexus-add-box {
+                border: 1px solid #d0e0ff;
+                background: #f5f9ff;
+                border-radius: 8px;
+                padding: 12px 15px;
+                margin-bottom: 20px;
+            }
+            .nexus-resolve-error {
+                margin-top: 10px;
+                color: #dc3545;
+                font-size: 0.9em;
+            }
+            .nexus-remote-card {
+                margin-top: 12px;
+                border: 1px solid #e0e0e0;
+                border-radius: 8px;
+                padding: 12px;
+                background: #fff;
+            }
+            .nexus-remote-desc {
+                font-size: 0.9em;
+                color: #555;
+                margin: 8px 0;
+            }
+            .nexus-app-state { margin: 8px 0 12px 0; }
+            .nexus-app-badges .nexus-badge {
+                display: inline-block;
+                padding: 2px 8px;
+                border-radius: 10px;
+                font-size: 0.78em;
+                background: #eee;
+                color: #555;
+                margin-right: 6px;
+            }
+            .nexus-badge-ok { background: #e6f6e6 !important; color: #1a7a1a !important; }
+            .nexus-badge-warn { background: #fff3e0 !important; color: #9a6200 !important; }
+            .nexus-badge-code { font-family: monospace; letter-spacing: 1px; }
+            .nexus-trust { font-size: 0.82em; color: #666; margin: 6px 0; }
+            .nexus-trust-label { color: #999; }
+            .nexus-addr { font-family: monospace; }
+            .nexus-explorer-link { font-size: 0.95em; }
+            .nexus-app-actions { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+            .nexus-app-actions button {
+                padding: 6px 12px;
+                border: 1px solid #ccc;
+                border-radius: 6px;
+                background: #fff;
+                cursor: pointer;
+                font-size: 0.85em;
+            }
+            .nexus-app-actions button:hover:not(:disabled) { background: #f2f6ff; border-color: #99b8e8; }
+            .nexus-app-actions button:disabled { opacity: 0.5; cursor: default; }
+            .nexus-app-status { margin-top: 6px; font-size: 0.85em; }
+            .nexus-app-status .success-message { color: #1a7a1a; }
+            .nexus-app-status .error-message { color: #dc3545; }
+            .nexus-app-status .info-message { color: #555; }
         </style>
     `;
 
     const appsHtml = apps.map(app => {
         const parts = [];
+        const state = appState.get(`${app.vendor}/${app.bundle}`);
 
         // Shared properties section
         if (app.shared.length > 0) {
@@ -1022,11 +1106,12 @@ function generateNexusUI(properties, backendConfig) {
         }).join('');
 
         if (skillsHtml) parts.push(skillsHtml);
-        if (parts.length === 0) return '';
+        if (parts.length === 0) parts.push('<p style="color:#888;font-size:0.9em;">No configurable properties.</p>');
 
         return `
             <div class="nexus-app" data-vendor="${app.vendor}" data-bundle="${app.bundle}">
                 <h4>${escapeHtml(capitalize(app.bundle))} <span style="font-weight:normal;color:#888;">(${escapeHtml(capitalize(app.vendor))})</span></h4>
+                ${renderNexusAppHeader(state)}
                 <div class="nexus-app-skills">${parts.join('')}</div>
                 <button type="button" class="nexus-reset-all-btn" data-vendor="${app.vendor}" data-bundle="${app.bundle}">Reset all properties in this Nexus App</button>
             </div>
@@ -1035,6 +1120,7 @@ function generateNexusUI(properties, backendConfig) {
 
     return `
         ${nexusStyles}
+        ${renderNexusAddBox()}
         <div class="nexus-search-container">
             <input
                 type="search"
@@ -1043,9 +1129,146 @@ function generateNexusUI(properties, backendConfig) {
                 autocomplete="off"
             >
             <div id="nexus-search-status"></div>
+            <div class="nexus-search-options">
+                <label><input type="checkbox" id="nexus-modified-toggle"> Show only modified properties</label>
+            </div>
         </div>
-        <div class="nexus-apps-list">${appsHtml}</div>
+        <div class="nexus-apps-list">${appsHtml || ''}</div>
     `;
+}
+
+// ---------------------------------------------------------------------
+// Nexus subscriptions & install (Stage C)
+// ---------------------------------------------------------------------
+
+function nexusExplorerLinks(state) {
+    if (!state) return '';
+    const links = [];
+    if (state.creatorId) {
+        links.push(
+            `<span class="nexus-trust-label">creator</span> ` +
+            `<span class="nexus-addr" title="${escapeHtml(state.creatorId)}">${escapeHtml(shortAddr(state.creatorId))}</span>` +
+            ` <a href="#" class="nexus-explorer-link" data-kind="account" data-addr="${escapeHtml(state.creatorId)}">view on explorer</a>`
+        );
+    }
+    if (state.collection) {
+        links.push(
+            `<span class="nexus-trust-label">NFT collection</span> ` +
+            `<span class="nexus-addr" title="${escapeHtml(state.collection)}">${escapeHtml(shortAddr(state.collection))}</span>` +
+            ` <a href="#" class="nexus-explorer-link" data-kind="token" data-addr="${escapeHtml(state.collection)}">view on explorer</a>`
+        );
+    }
+    return links.length ? `<div class="nexus-trust">${links.join('<br>')}</div>` : '';
+}
+
+function shortAddr(addr) {
+    return addr.length > 14 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
+}
+
+function renderNexusAppHeader(state) {
+    if (!state) return '';
+    const bits = [];
+    bits.push(`<span class="nexus-meta">v${escapeHtml(state.version || '?')} · ${escapeHtml(state.source || 'installed')}</span>`);
+
+    if (state.gated) {
+        const sub = state.subscription || {};
+        if (sub.subscribed) {
+            bits.push(`<span class="nexus-badge nexus-badge-ok" title="Continuous access while your NFT is held — verified on-chain periodically, no action needed">NFT validated</span>`);
+            if (sub.code) bits.push(`<span class="nexus-badge nexus-badge-code" title="Subscription receipt">${escapeHtml(sub.code)}</span>`);
+        } else {
+            const reasons = {
+                no_subscription: 'NFT ownership required — verify your wallet',
+                tampered_or_invalid: 'Verification invalid — verify your wallet again',
+                licensing_unavailable: 'Licensing backend unavailable',
+                invalid_identity: 'Invalid bundle identity',
+            };
+            bits.push(`<span class="nexus-badge nexus-badge-warn">${escapeHtml(reasons[sub.reason] || 'NFT ownership required')}</span>`);
+        }
+    } else {
+        bits.push('<span class="nexus-badge">Open app</span>');
+    }
+
+    if (state.identity_verified) {
+        bits.push('<span class="nexus-badge nexus-badge-ok" title="Manifest signed by the creator\'s Solana key">Verified author</span>');
+    } else {
+        bits.push(`<span class="nexus-badge nexus-badge-warn" title="${escapeHtml(state.identity_reason || '')}">Unverified author</span>`);
+    }
+
+    const actions = [];
+    if (state.gated && !(state.subscription && state.subscription.subscribed)) {
+        actions.push(`<button type="button" class="nexus-subscribe-btn" data-vendor="${escapeHtml(state.vendor)}" data-app="${escapeHtml(state.app)}">Verify wallet</button>`);
+    }
+    actions.push(`<button type="button" class="nexus-uninstall-btn" data-vendor="${escapeHtml(state.vendor)}" data-app="${escapeHtml(state.app)}">Uninstall</button>`);
+
+    return `
+        <div class="nexus-app-state">
+            <div class="nexus-app-badges">${bits.join(' ')}</div>
+            ${nexusExplorerLinks(state)}
+            <div class="nexus-app-actions">${actions.join(' ')}</div>
+            <div class="nexus-app-status"></div>
+        </div>
+    `;
+}
+
+function renderNexusAddBox() {
+    return `
+        <div class="nexus-add-box">
+            <h4 style="margin:0 0 6px 0;">Add a Nexus App</h4>
+            <p style="margin:0 0 10px 0;font-size:0.9em;color:#666;">
+                Enter the app name or address (e.g. <code>myapp</code> or <code>myapp.nexus</code>).
+            </p>
+            <div style="display:flex;gap:8px;">
+                <input type="text" id="nexus-add-input" placeholder="myapp" autocomplete="off" style="flex:1;padding:8px 10px;border:1px solid #ddd;border-radius:6px;">
+                <button type="button" id="nexus-add-btn" class="btn">Find app</button>
+            </div>
+            <div id="nexus-resolve-result"></div>
+        </div>
+    `;
+}
+
+function renderNexusRemoteCard(s) {
+    if (!s || s.ok === false) {
+        return `<div class="nexus-resolve-error">${escapeHtml((s && s.message) || 'Lookup failed.')}</div>`;
+    }
+    const bits = [];
+    bits.push(`<strong>${escapeHtml(capitalize(s.app))}</strong> <span style="color:#888;">(${escapeHtml(capitalize(s.vendor))})</span>`);
+    bits.push(`<span class="nexus-badge">v${escapeHtml(s.latest)}</span>`);
+    if (s.gated) {
+        bits.push('<span class="nexus-badge nexus-badge-warn">Requires NFT ownership</span>');
+        const sub = s.subscription || {};
+        if (sub.subscribed) bits.push('<span class="nexus-badge nexus-badge-ok">NFT validated</span>');
+    } else {
+        bits.push('<span class="nexus-badge">Open app</span>');
+    }
+    if (s.installed_version) {
+        const upToDate = compareVersions(s.latest, s.installed_version) <= 0;
+        bits.push(`<span class="nexus-badge ${upToDate ? 'nexus-badge-ok' : 'nexus-badge-warn'}">installed v${escapeHtml(s.installed_version)}${upToDate ? ' (up to date)' : ''}</span>`);
+    }
+
+    const actions = [];
+    const actionLabel = !s.installed_version ? 'Install' : (compareVersions(s.latest, s.installed_version) > 0 ? `Update to v${escapeHtml(s.latest)}` : 'Reinstall');
+    actions.push(`<button type="button" class="nexus-install-btn" data-source="${escapeHtml(s.source_host || '')}">${actionLabel}</button>`);
+
+    return `
+        <div class="nexus-remote-card" data-source="${escapeHtml(s.source_host || '')}">
+            <div class="nexus-app-badges">${bits.join(' ')}</div>
+            ${s.gated ? '<div class="nexus-remote-desc">NFT ownership (verified on-chain) is required to install this app and to keep it running. Verify with your wallet below if needed.</div>' : ''}
+            ${s.description ? `<div class="nexus-remote-desc">${escapeHtml(s.description)}</div>` : ''}
+            ${nexusExplorerLinks({ creatorId: s.creatorId, collection: s.collection })}
+            <div class="nexus-app-actions">${actions.join(' ')}</div>
+            <div class="nexus-app-status"></div>
+        </div>
+    `;
+}
+
+function compareVersions(a, b) {
+    const pa = String(a || '').split(/[.\-+]/).map(x => parseInt(x, 10) || 0);
+    const pb = String(b || '').split(/[.\-+]/).map(x => parseInt(x, 10) || 0);
+    for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+        const d = (pa[i] || 0) - (pb[i] || 0);
+        if (d !== 0) return d;
+    }
+    return 0;
 }
 
 function setupTabListeners() {
@@ -1165,16 +1388,19 @@ function setupNexusListeners(ctx) {
 
     const searchInput = document.getElementById('nexus-search-input');
     if (searchInput) {
-        searchInput.addEventListener('input', () => {
+        const modifiedToggle = document.getElementById('nexus-modified-toggle');
+
+        const applyNexusFilters = () => {
             const rawQuery = searchInput.value.trim();
             const query = rawQuery.toLowerCase();
             const statusEl = document.getElementById('nexus-search-status');
             const allItems = Array.from(document.querySelectorAll('.nexus-param-item'));
+            const onlyModified = !!(modifiedToggle && modifiedToggle.checked);
 
-            // Clear search: show everything again
-            if (!query) {
+            // Nothing active: show everything again
+            if (!query && !onlyModified) {
                 resetNexusSearchVisibility();
-                if (statusEl) statusEl.textContent = '';
+                if (statusEl) { statusEl.textContent = ''; statusEl.classList.remove('too-many'); }
                 return;
             }
 
@@ -1183,12 +1409,13 @@ function setupNexusListeners(ctx) {
 
             allItems.forEach(item => {
                 const haystack = (item.dataset.search || '').toLowerCase();
-                const matches = tokens.every(token => haystack.includes(token));
-                item.style.display = matches ? '' : 'none';
-                if (matches) matchCount++;
+                const matchesSearch = tokens.every(token => haystack.includes(token));
+                const visible = matchesSearch && (!onlyModified || item.classList.contains('modified'));
+                item.style.display = visible ? '' : 'none';
+                if (visible) matchCount++;
             });
 
-            if (matchCount > NEXUS_SEARCH_MAX_RESULTS) {
+            if (query && matchCount > NEXUS_SEARCH_MAX_RESULTS) {
                 // Too many matches: hide everything and ask the user to narrow down
                 allItems.forEach(item => { item.style.display = 'none'; });
                 if (statusEl) {
@@ -1197,18 +1424,252 @@ function setupNexusListeners(ctx) {
                 }
             } else {
                 if (statusEl) {
-                    if (matchCount === 0) {
-                        statusEl.textContent = 'No matching properties.';
-                    } else {
-                        statusEl.textContent = `${matchCount} result${matchCount === 1 ? '' : 's'}`;
-                    }
+                    statusEl.textContent = matchCount === 0
+                        ? 'No matching properties.'
+                        : `${matchCount} result${matchCount === 1 ? '' : 's'}`;
                     statusEl.classList.remove('too-many');
                 }
             }
 
             updateNexusSkillSummaries();
             refreshNexusContainerVisibility();
+        };
+
+        searchInput.addEventListener('input', applyNexusFilters);
+        if (modifiedToggle) modifiedToggle.addEventListener('change', applyNexusFilters);
+    }
+
+    setupNexusLifecycleListeners(ctx);
+}
+
+// ---------------------------------------------------------------------
+// Nexus subscriptions & install — lifecycle listeners (Stage C)
+// ---------------------------------------------------------------------
+
+let nexusLifecycleDelegationInstalled = false;
+
+function setupNexusLifecycleListeners(ctx) {
+    const pybridgeUrl = ctx.config.get('pybridge.api_url');
+    const openExternal = (url) => ctx.ipcRenderer.send('open-external', url);
+
+    const resolveSource = async (source) => {
+        const resp = await fetch(pybridgeUrl + '/nexus/install/resolve', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ source })
         });
+        const data = await resp.json();
+        if (!resp.ok) data.ok = false;
+        return data;
+    };
+
+    const portalUrl = (s, installed) => {
+        const params = new URLSearchParams({ app: `${s.vendor}/${s.app}` });
+        if (!installed) {
+            if (s.collection) params.set('collection', s.collection);
+            if (s.creatorId) params.set('creator', s.creatorId);
+            if (s.latest) params.set('version', s.latest);
+        }
+        return `${pybridgeUrl}/nexus/subscription/portal?${params.toString()}`;
+    };
+
+    const setStatus = (container, text, cls) => {
+        const el = container && container.querySelector('.nexus-app-status');
+        if (el) { el.textContent = text || ''; el.className = `nexus-app-status ${cls || ''}`; }
+    };
+
+    const refreshUI = () => generateSkillsUI(ctx);
+
+    // Event delegation (survives re-renders); registered once per window
+    if (!nexusLifecycleDelegationInstalled) {
+        nexusLifecycleDelegationInstalled = true;
+
+        document.addEventListener('click', async (e) => {
+            // Explorer links (creator / collection)
+            const explorer = e.target.closest('.nexus-explorer-link');
+            if (explorer) {
+                e.preventDefault();
+                const kind = explorer.dataset.kind === 'token' ? 'token' : 'account';
+                openExternal(`https://solscan.io/${kind}/${explorer.dataset.addr}`);
+                return;
+            }
+
+            // Verify wallet (installed app, lapsed): portal reads the
+            // local manifest; on success the card flips back to active
+            const subBtn = e.target.closest('.nexus-subscribe-btn');
+            if (subBtn) {
+                const vendor = subBtn.dataset.vendor, app = subBtn.dataset.app;
+                const container = subBtn.closest('.nexus-app-state');
+                openExternal(portalUrl({ vendor, app }, true));
+                setStatus(container, 'Waiting for wallet verification (complete the sign in your browser)…', 'info-message');
+                const started = Date.now();
+                const timer = setInterval(async () => {
+                    if (Date.now() - started > 180000) {
+                        clearInterval(timer);
+                        setStatus(container, 'Verification timed out — try again.', 'error-message');
+                        return;
+                    }
+                    try {
+                        const resp = await fetch(pybridgeUrl + '/nexus/apps');
+                        const apps = await resp.json();
+                        const st = (apps || []).find(
+                            a => a.vendor === vendor && a.app === app
+                        );
+                        if (st && st.subscription && st.subscription.subscribed) {
+                            clearInterval(timer);
+                            setStatus(container, 'Subscription active!', 'success-message');
+                            setTimeout(refreshUI, 800);
+                        }
+                    } catch (err) { /* keep polling */ }
+                }, 2000);
+                return;
+            }
+
+            // Uninstall: remove the app; the NFT and subscription state
+            // remain (a reinstall does not need to re-subscribe)
+            const unsubBtn = e.target.closest('.nexus-uninstall-btn');
+            if (unsubBtn) {
+                const vendor = unsubBtn.dataset.vendor, app = unsubBtn.dataset.app;
+                if (!confirm(`Uninstall ${vendor}/${app}? Your NFT and subscription remain valid — reinstalling later won't require verifying again.`)) return;
+                try {
+                    const resp = await fetch(`${pybridgeUrl}/nexus/app/${vendor}/${app}`, { method: 'DELETE' });
+                    const data = await resp.json();
+                    if (!data.ok) {
+                        alert('Uninstall failed: ' + (data.message || 'unknown error'));
+                        return;
+                    }
+                    // Mirror the install flow: reload Orakle so the app's
+                    // skills/properties disappear, then refresh the step
+                    const orakleUrl = ctx.config.get('orakle.api_url');
+                    setStatus(unsubBtn.closest('.nexus-app').querySelector('.nexus-app-state') || unsubBtn.parentElement,
+                        'Uninstalled. Reloading…', 'info-message');
+                    ctx.ipcRenderer.send('nexus:reload-orakle');
+                    const started = Date.now();
+                    const timer = setInterval(async () => {
+                        if (Date.now() - started > 180000) { clearInterval(timer); refreshUI(); return; }
+                        try {
+                            const props = await fetch(orakleUrl + '/capabilities?view=properties').then(r => r.json());
+                            if (!Object.keys(props || {}).some(k => k.includes(`.nexus.${vendor}.${app}`))) {
+                                clearInterval(timer);
+                                refreshUI();
+                            }
+                        } catch (err) { /* keep polling */ }
+                    }, 2000);
+                } catch (err) {
+                    alert('Uninstall failed: ' + err.message);
+                }
+                return;
+            }
+
+            // Install / Update / Reinstall — subscribes first (portal +
+            // poll) when the app is gated and the wallet isn't verified
+            const installBtn = e.target.closest('.nexus-install-btn');
+            if (installBtn && !installBtn.disabled) {
+                const source = installBtn.dataset.source;
+                const card = installBtn.closest('.nexus-remote-card');
+                if (!source) return;
+                installBtn.disabled = true;
+
+                const waitForSubscription = (s) => new Promise((resolve) => {
+                    setStatus(card, 'NFT ownership required — complete the wallet sign, the app will install automatically…', 'info-message');
+                    const started = Date.now();
+                    const timer = setInterval(async () => {
+                        if (Date.now() - started > 300000) {
+                            clearInterval(timer);
+                            resolve(false);
+                            return;
+                        }
+                        try {
+                            const st = await resolveSource(source);
+                            if (st.subscription && st.subscription.subscribed) {
+                                clearInterval(timer);
+                                resolve(true);
+                            }
+                        } catch (err) { /* keep polling */ }
+                    }, 2000);
+                });
+
+                const waitForCapabilities = (vendor, app) => new Promise((resolve) => {
+                    const orakleUrl = ctx.config.get('orakle.api_url');
+                    const started = Date.now();
+                    const timer = setInterval(async () => {
+                        if (Date.now() - started > 180000) { clearInterval(timer); resolve(); return; }
+                        try {
+                            const props = await fetch(orakleUrl + '/capabilities?view=properties').then(r => r.json());
+                            if (Object.keys(props || {}).some(k => k.includes(`.nexus.${vendor}.${app}`))) {
+                                clearInterval(timer);
+                                resolve();
+                            }
+                        } catch (err) { /* keep polling */ }
+                    }, 2000);
+                });
+
+                (async () => {
+                    try {
+                        setStatus(card, 'Checking requirements…', 'info-message');
+                        const s = await resolveSource(source);
+                        if (s.ok === false) {
+                            setStatus(card, s.message || 'Lookup failed.', 'error-message');
+                            installBtn.disabled = false;
+                            return;
+                        }
+                        const needsSubscribe = s.gated && !(s.subscription && s.subscription.subscribed);
+                        if (needsSubscribe) {
+                            openExternal(portalUrl(s, false));
+                            const okSub = await waitForSubscription(s);
+                            if (!okSub) {
+                                setStatus(card, 'Subscription timed out — try again.', 'error-message');
+                                installBtn.disabled = false;
+                                return;
+                            }
+                        }
+                        setStatus(card, 'Downloading and verifying…', 'info-message');
+                        const resp = await fetch(pybridgeUrl + '/nexus/install', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ source })
+                        });
+                        const data = await resp.json();
+                        if (data.ok) {
+                            setStatus(card, `Installed ${data.vendor}/${data.app} v${data.version}. Reloading skills…`, 'success-message');
+                            ctx.ipcRenderer.send('nexus:reload-orakle');
+                            await waitForCapabilities(data.vendor, data.app);
+                            refreshUI();
+                        } else {
+                            setStatus(card, data.message || 'Install failed.', 'error-message');
+                            installBtn.disabled = false;
+                        }
+                    } catch (err) {
+                        setStatus(card, 'Install failed: ' + err.message, 'error-message');
+                        installBtn.disabled = false;
+                    }
+                })();
+                return;
+            }
+        });
+    }
+
+    // Add box (per render)
+    const addBtn = document.getElementById('nexus-add-btn');
+    const addInput = document.getElementById('nexus-add-input');
+    if (addBtn && addInput) {
+        const doResolve = async () => {
+            const source = addInput.value.trim();
+            if (!source) return;
+            const resultEl = document.getElementById('nexus-resolve-result');
+            addBtn.disabled = true;
+            resultEl.innerHTML = '<div class="info-message">Looking up…</div>';
+            try {
+                const s = await resolveSource(source);
+                resultEl.innerHTML = renderNexusRemoteCard(s);
+            } catch (err) {
+                resultEl.innerHTML = `<div class="nexus-resolve-error">${escapeHtml(err.message)}</div>`;
+            } finally {
+                addBtn.disabled = false;
+            }
+        };
+        addBtn.addEventListener('click', doResolve);
+        addInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') doResolve(); });
     }
 }
 

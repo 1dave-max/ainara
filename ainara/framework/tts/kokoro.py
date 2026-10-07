@@ -33,6 +33,7 @@ from misaki.espeak import EspeakG2P
 from pygame import USEREVENT, mixer
 
 from ..config import config
+from ..config import get_data_dir
 from .base import TTSBackend
 
 
@@ -80,7 +81,7 @@ class KokoroTTS(TTSBackend):
         # Define Model Directories
         # 1. User Data Directory (Persistent downloads)
         self.user_models_dir = (
-            Path(config.get_default_data_dir()) / "tts" / "kokoro" / "models"
+            get_data_dir() / "tts" / "kokoro" / "models"
         )
         # 2. Bundled Resources Directory (App distribution)
         self.bundled_models_dir = (
@@ -95,7 +96,9 @@ class KokoroTTS(TTSBackend):
         if not self.setup():
             msg = (
                 "Kokoro TTS setup failed. Model files (kokoro-v1.0.onnx,"
-                " voices.json) not found in bundled or user directories."
+                " voices-v1.0.bin) not found in bundled or user directories."
+                " Run 'npm run setup' (or scripts/fetch_models.py) to fetch"
+                " them."
             )
             self.logger.error(msg)
             raise RuntimeError(msg)

@@ -62,32 +62,6 @@ const ollama = require('ollama');
 
 const config = new ConfigManager();
 
-// Edition of this bundle: 'public' (no wallet/NFT gate) or 'supporters'.
-// Resolution order: AINARA_EDITION env override → '.edition' marker shipped
-// inside the servers bundle → default 'public'. Real entitlement enforcement
-// lives inside the protected skills, so a missing marker only means the UI
-// does not ask for a wallet.
-function resolveAppEdition() {
-    const envEdition = (process.env.AINARA_EDITION || '').trim().toLowerCase();
-    if (envEdition === 'public' || envEdition === 'supporters') {
-        return envEdition;
-    }
-    const baseDir = ServiceManager.executablesDir;
-    for (const rel of [path.join('_internal', '.edition'), '.edition']) {
-        try {
-            const value = fs.readFileSync(path.join(baseDir, rel), 'utf8').trim().toLowerCase();
-            if (value === 'public' || value === 'supporters') {
-                return value;
-            }
-        } catch (e) { /* marker not at this path — try next candidate */ }
-    }
-    if (app.isPackaged) {
-        Logger.warn(`Edition marker not found under ${baseDir}; defaulting to 'public'`);
-    }
-    return 'public';
-}
-const appEdition = resolveAppEdition();
-
 function detectSentinelRequest() {
     if (process.argv.includes('--sentinel')) {
         return { sentinel: true, invalidEnvValue: null };
@@ -113,8 +87,6 @@ let shortcutRegistered = false;
 let splashWindow = null;
 let setupWindow = null;
 let wizardActive = false;
-let reauthMode = false;
-let reauthResolve = null;
 let updateProgressWindow = null;
 let ollamaClient = null;
 let appReady = false;
@@ -129,16 +101,15 @@ let trayState = null;
 let trayListening = null;
 let trayNotifications = null;
 
-// TODO delayed to v0.10
-// function applyAutoStartSetting() {
-//     const autoStartEnabled = config.get('startup.autoStart', false);
-//     Logger.info(`Applying auto-start setting. Enabled: ${autoStartEnabled}`);
-//     // This API is cross-platform and handles the underlying OS specifics.
-//     app.setLoginItemSettings({
-//         openAtLogin: autoStartEnabled,
-//         path: app.getPath('exe') // This is used by Windows and ignored by others.
-//     });
-// }
+function applyAutoStartSetting() {
+    const autoStartEnabled = config.get('startup.autoStart', false);
+    Logger.info(`Applying auto-start setting. Enabled: ${autoStartEnabled}`);
+    // This API is cross-platform and handles the underlying OS specifics.
+    app.setLoginItemSettings({
+        openAtLogin: autoStartEnabled,
+        path: app.getPath('exe') // This is used by Windows and ignored by others.
+    });
+}
 
 // Check if this is the first run of the application
 function isFirstRun() {
@@ -203,15 +174,12 @@ async function setupComplete() {
 
 
 // Show the setup wizard for first-time users
-function showSetupWizard(validationErrors = [], options = {}) {
-    const { reauth = false } = options;
-    reauthMode = reauth;
-
+function showSetupWizard(validationErrors = []) {
     if (validationErrors && validationErrors.length > 0 && config.get("setup.completed", false)) {
         Logger.warn('Configuration validation failed, invalidating setup.complete because of these errors:', validationErrors);
         config.set("setup.completed", false);
     } else {
-        Logger.info(reauth ? 'Showing re-auth wizard' : 'Showing setup wizard');
+        Logger.info('Showing setup wizard');
     }
 
     // Notify com-ring wizard active
@@ -221,13 +189,10 @@ function showSetupWizard(validationErrors = [], options = {}) {
         }
     });
 
-    // Only full setup tears down tray/shortcuts/config
-    if (!reauth) {
-        if (tray) { tray.destroy(); tray = null; }
-        config.set('setup.completed', false);
-        globalShortcut.unregisterAll();
-        shortcutRegistered = false;
-    }
+    if (tray) { tray.destroy(); tray = null; }
+    config.set('setup.completed', false);
+    globalShortcut.unregisterAll();
+    shortcutRegistered = false;
 
     wizardActive = true;
 
@@ -235,17 +200,14 @@ function showSetupWizard(validationErrors = [], options = {}) {
     const iconPath = path.resolve(__dirname, 'assets', `tray-icon-active-${theme}.png`);
     const { width: screenWidth, height: screenHeight } = screen.getPrimaryDisplay().workAreaSize;
 
-    const winWidth = reauth ? 480 : Math.floor(screenWidth * 0.7);
-    const winHeight = reauth ? 620 : Math.floor(screenHeight * 0.95);
-
     setupWindow = new BrowserWindow({
-        width: winWidth,
-        height: winHeight,
+        width: Math.floor(screenWidth * 0.7),
+        height: Math.floor(screenHeight * 0.95),
         webPreferences: {
             nodeIntegration: true,
             contextIsolation: false
         },
-        title: reauth ? 'License Verification' : 'Polaris Setup',
+        title: 'Polaris Setup',
         show: false,
         center: true,
         resizable: false,
@@ -270,7 +232,7 @@ function showSetupWizard(validationErrors = [], options = {}) {
     setupWindow.setIcon(iconPath);
     setupWindow.loadFile(
         path.join(__dirname, 'components', 'setup.html'),
-        { query: { mode: reauth ? 'reauth' : 'full', edition: appEdition } }
+        { query: { mode: 'full' } }
     );
 
     setupWindow.once('ready-to-show', () => {
@@ -281,13 +243,6 @@ function showSetupWizard(validationErrors = [], options = {}) {
             );
         }
         setupWindow.show();
-    });
-}
-
-function showReauthWizard() {
-    return new Promise((resolve) => {
-        reauthResolve = resolve;
-        showSetupWizard([], { reauth: true });
     });
 }
 
@@ -353,6 +308,10 @@ async function appFirstInitializationTasks() {
     app.commandLine.appendSwitch('ozone-platform', 'x11');
     await app.whenReady();
 
+    // Apply auto-start setting on launch (in case it drifted, e.g. a reinstall
+    // or the user toggled it outside Ainara).
+    applyAutoStartSetting();
+
     // --- Sentinel mode fork (before any Polaris-only initialization) ---
     if (requestedSentinel.invalidEnvValue) {
         dialog.showErrorBox(
@@ -378,9 +337,6 @@ async function appFirstInitializationTasks() {
         }
         Logger.info('Sentinel mode requested but setup incomplete, running setup first');
     }
-
-    // // Apply auto-start setting on launch
-    // applyAutoStartSetting();
 
     // Initialize Ollama client
     initializeOllamaClient();
@@ -602,33 +558,6 @@ async function appInitialization(firstInitialization = true) {
             Logger.error('Error fetching documentation sites:', e);
         }
 
-        // AUTHENTICATION CHECK
-        if (appEdition !== 'public') {
-            splashWindow.updateProgress('Verifying Access...', 70);
-        }
-
-        // // Check Internet Connection before Auth
-        // while (!await checkInternetConnection()) {
-        //     const response = dialog.showMessageBoxSync({
-        //         type: 'error',
-        //         buttons: ['Retry', 'Quit'],
-        //         title: 'No Internet Connection',
-        //         message: 'Polaris requires an active internet connection to verify your access.',
-        //         detail: 'Please check your connection and try again.'
-        //     });
-        //     if (response === 1) { // Quit
-        //         app.quit();
-        //         return;
-        //     }
-        // }
-
-        if (appEdition === 'public') {
-            Logger.info('Public edition: skipping wallet/NFT authorization gate');
-        } else if (!await checkBackendAuth(splashWindow)) {
-            app.quit(); // User closed the wizard or auth failed → exit
-            return;
-        }
-
         // Services are ready, check config and initialize the rest of the app
         splashWindow.updateProgress('Verifying configuration...', 75);
 
@@ -659,56 +588,6 @@ async function appInitialization(firstInitialization = true) {
 
         if (!isRunningAsAppX()) {
             initializeAutoUpdater();
-        }
-
-        /**
-         * New Backend-Centric Gatekeeper
-         */
-        async function checkBackendAuth(splash) {
-            const pybridgeUrl = config.get('pybridge.api_url', 'http://127.0.0.1:8101');
-            const { net } = require('electron');
-
-            // Loop to handle retryable network errors from backend
-            while (true) {
-                try {
-                    Logger.info("Auth: Checking status with backend...");
-                    const response = await net.fetch(`${pybridgeUrl}/auth/status`);
-
-                    if (response.ok) {
-                        const status = await response.json();
-                        if (status.authorized) {
-                            Logger.info(`Auth: Authorized (Wallet: ${status.wallet})`);
-                            return true;
-                        }
-
-                        // Handle Network Error specifically (Backend couldn't reach Solana)
-                        if (status.reason === 'network_error') {
-                            const response = dialog.showMessageBoxSync({
-                                type: 'error',
-                                buttons: ['Retry', 'Quit'],
-                                title: 'Connection Error',
-                                message: 'Unable to reach Solana network to verify ownership.',
-                                detail: 'Please check your connection and try again.'
-                            });
-                            if (response === 1) { // Quit
-                                app.quit();
-                                return false;
-                            }
-                            continue; // Retry loop
-                        }
-
-                        Logger.warn(`Auth: Unauthorized (${status.reason}). Launching Setup.`);
-                        break; // Exit loop to show setup
-                    }
-                } catch (error) {
-                    Logger.error("Auth: Failed to contact backend.", error);
-                    break; // Fall through to setup
-                }
-            }
-
-            // If we get here, we are not authorized
-            splash.close();
-            return await showReauthWizard();
         }
 
         checkFirstRunTasks();
@@ -1345,10 +1224,10 @@ function appSetupEventHandlers() {
         shell.openExternal(url);
     });
 
-    // // Handle auto-start setting changes from setup wizard
-    // ipcMain.on('set-auto-start', () => {
-    //     applyAutoStartSetting();
-    // });
+    // Handle auto-start setting changes from setup wizard
+    ipcMain.on('set-auto-start', () => {
+        applyAutoStartSetting();
+    });
 
     // Handle backup directory selection from setup wizard
     ipcMain.on('select-backup-directory', async (event) => {
@@ -1492,24 +1371,36 @@ function appSetupEventHandlers() {
     });
 
     // Add: Handler to open the auth portal
-    ipcMain.on('open-auth-portal', () => {
-        const pybridgeUrl = config.get('pybridge.api_url', 'http://127.0.0.1:8101');
-        shell.openExternal(`${pybridgeUrl}/auth/portal`);
+    // Generic external opener (Nexus subscription portals, explorer links)
+    ipcMain.on('open-external', (_event, url) => {
+        if (typeof url === 'string' && /^https?:\/\//i.test(url)) {
+            shell.openExternal(url);
+        } else {
+            Logger.warn('open-external: rejected URL', url);
+        }
     });
 
-    // Handle closing the setup wizard (full or re-auth)
+    // Restart Orakle so a freshly installed Nexus App's skills/properties
+    // are discovered (capabilities discovery runs at server startup)
+    ipcMain.on('nexus:reload-orakle', async (event) => {
+        try {
+            Logger.info('Nexus: restarting Orakle to pick up installed bundle');
+            await ServiceManager.restartService(ServiceManager.services.orakle);
+            Logger.info('Nexus: Orakle restarted');
+        } catch (e) {
+            Logger.error('Nexus: Orakle restart failed:', e);
+        } finally {
+            if (event.sender && !event.sender.isDestroyed()) {
+                event.sender.send('nexus:orakle-reloaded');
+            }
+        }
+    });
+
+    // Handle closing the setup wizard
     ipcMain.on('close-setup-window', async () => {
         Logger.info('close-setup-window event');
         if (setupWindow && !setupWindow.isDestroyed()) {
             setupWindow.destroy();
-        }
-
-        if (reauthMode) {
-            reauthMode = false;
-            reauthResolve?.(false);
-            reauthResolve = null;
-            app.quit(); // User closed re-auth without completing → quit
-            return;
         }
 
         if (config.get('setup.completed', false)) {
@@ -1523,24 +1414,6 @@ function appSetupEventHandlers() {
 
     // Handle setup completion
     ipcMain.on('setup-complete', setupComplete);
-
-    // Handle successful re-verification (reauth mode)
-    ipcMain.on('license-verified', () => {
-        if (reauthMode) {
-            wizardActive = false;
-            BrowserWindow.getAllWindows().forEach(window => {
-                if (!window.isDestroyed()) {
-                    window.webContents.send('wizard-status', false);
-                }
-            });
-            reauthMode = false;
-            if (setupWindow && !setupWindow.isDestroyed()) {
-                setupWindow.destroy();
-            }
-            reauthResolve?.(true);
-            reauthResolve = null;
-        }
-    });
 
 }
 
